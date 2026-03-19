@@ -1,0 +1,41 @@
+                    GNU AFFERO GENERAL PUBLIC LICENSE
+                       Version 3, 19 November 2007
+
+ Copyright (C) 2024 Aaditya Anand (GitHub: Aaditya-Anand11)
+ Contact: aa5256@srmist.edu.in
+
+ This program is free software: you can redistribute it and/or modify
+ it under the terms of the GNU Affero General Public License as published
+ by the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU Affero General Public License for more details.
+
+ You should have received a copy of the GNU Affero General Public License
+ along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+---
+
+ADDITIONAL TERMS (Attribution Requirement):
+
+Any use, reproduction, modification, or distribution of this software,
+in whole or in part, must include clear and prominent attribution to:
+
+    Aaditya Anand — Original Author
+    Repository: https://github.com/Aaditya-Anand11/NeuroLens
+
+This attribution must appear in:
+1. All copies or substantial portions of the software
+2. All derivative works, forks, or projects built upon this code
+3. Any academic papers, blog posts, or public presentations referencing this work
+4. The README or documentation of any project that includes or derives from this code
+
+You may NOT remove or alter this attribution, present this work as your own,
+or claim original authorship of any part of this codebase.
+
+---
+
+Full AGPL-3.0 License text: https://www.gnu.org/licenses/agpl-3.0.html
