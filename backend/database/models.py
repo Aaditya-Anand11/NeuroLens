@@ -26,6 +26,7 @@ class User(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String(100), unique=True, nullable=False)
+    password_hash = Column(String(255), nullable=False, default="")
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     calibration = relationship("CalibrationProfile", back_populates="user", uselist=False)

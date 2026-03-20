@@ -18,6 +18,9 @@ COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
 COPY --from=builder /app/public ./public
 
+RUN addgroup -S neurolens && adduser -S neurolens -G neurolens && chown -R neurolens:neurolens /app
+USER neurolens
+
 EXPOSE 3000
 
 CMD ["node", "server.js"]

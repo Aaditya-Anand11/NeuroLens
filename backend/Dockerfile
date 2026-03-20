@@ -19,6 +19,9 @@ COPY models/ /app/models/
 
 ENV PYTHONPATH=/app
 
+RUN useradd -r -s /bin/false neurolens && chown -R neurolens:neurolens /app
+USER neurolens
+
 EXPOSE 8000
 
 CMD ["uvicorn", "neurolens.backend.main:app", "--host", "0.0.0.0", "--port", "8000"]

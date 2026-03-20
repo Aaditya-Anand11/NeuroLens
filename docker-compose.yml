@@ -9,8 +9,10 @@ services:
       - "8000:8000"
     environment:
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:?JWT_SECRET_KEY is required}
+      - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:-60}
     volumes:
-      - ./neurolens.db:/app/neurolens.db
+      - neurolens-data:/app/data
       - ./models:/app/models
     restart: unless-stopped
     healthcheck:
@@ -32,3 +34,6 @@ services:
       backend:
         condition: service_healthy
     restart: unless-stopped
+
+volumes:
+  neurolens-data:

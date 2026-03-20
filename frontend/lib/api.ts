@@ -1,10 +1,54 @@
 /**
  * API client for NeuroLens backend.
- * Handles REST endpoints and WebSocket connection management.
+ * Handles REST endpoints, JWT authentication, and WebSocket connection management.
  */
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 const WS_BASE = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000";
+
+const TOKEN_KEY = "neurolens_token";
+const USER_KEY = "neurolens_user";
+
+// --- Auth token management ---
+
+export interface AuthUser {
+  user_id: number;
+  username: string;
+  access_token: string;
+}
+
+export function getStoredAuth(): AuthUser | null {
+  if (typeof window === "undefined") return null;
+  const token = sessionStorage.getItem(TOKEN_KEY);
+  const user = sessionStorage.getItem(USER_KEY);
+  if (!token || !user) return null;
+  try {
+    return { ...JSON.parse(user), access_token: token };
+  } catch {
+    return null;
+  }
+}
+
+function storeAuth(auth: AuthUser): void {
+  sessionStorage.setItem(TOKEN_KEY, auth.access_token);
+  sessionStorage.setItem(
+    USER_KEY,
+    JSON.stringify({ user_id: auth.user_id, username: auth.username })
+  );
+}
+
+export function clearAuth(): void {
+  sessionStorage.removeItem(TOKEN_KEY);
+  sessionStorage.removeItem(USER_KEY);
+}
+
+function getToken(): string {
+  const auth = getStoredAuth();
+  if (!auth) throw new Error("Not authenticated");
+  return auth.access_token;
+}
+
+// --- Interfaces ---
 
 export interface FatigueUpdate {
   type: "fatigue_update";
@@ -95,11 +139,28 @@ export interface InterventionRecord {
   was_dismissed: boolean;
 }
 
+// --- Fetch helpers ---
+
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+
+  // Add auth header for non-auth endpoints
+  if (!path.startsWith("/api/auth/") && path !== "/api/health") {
+    headers["Authorization"] = `Bearer ${getToken()}`;
+  }
+
   const res = await fetch(`${API_BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
+    headers,
     ...options,
   });
+
+  if (res.status === 401) {
+    clearAuth();
+    throw new Error("Session expired. Please log in again.");
+  }
+
   if (!res.ok) {
     const error = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(error.detail || `API error: ${res.status}`);
@@ -107,11 +168,47 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
   return res.json();
 }
 
+// --- API methods ---
+
 export const api = {
-  startSession: (userId = 1) =>
+  // Auth (public)
+  register: async (username: string, password: string) => {
+    const result = await apiFetch<{
+      access_token: string;
+      token_type: string;
+      user_id: number;
+      username: string;
+    }>("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    });
+    storeAuth(result);
+    return result;
+  },
+
+  login: async (username: string, password: string) => {
+    const result = await apiFetch<{
+      access_token: string;
+      token_type: string;
+      user_id: number;
+      username: string;
+    }>("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    });
+    storeAuth(result);
+    return result;
+  },
+
+  logout: () => {
+    clearAuth();
+  },
+
+  // Authenticated endpoints
+  startSession: () =>
     apiFetch<{ session_id: number; started_at: string; status: string }>(
       "/api/session/start",
-      { method: "POST", body: JSON.stringify({ user_id: userId }) }
+      { method: "POST", body: JSON.stringify({}) }
     ),
 
   stopSession: (sessionId?: number) =>
@@ -126,9 +223,9 @@ export const api = {
       body: JSON.stringify({ session_id: sessionId }),
     }),
 
-  getSessions: (userId = 1, activeOnly = false, limit = 20) =>
+  getSessions: (activeOnly = false, limit = 20) =>
     apiFetch<SessionInfo[]>(
-      `/api/session?user_id=${userId}&active_only=${activeOnly}&limit=${limit}`
+      `/api/session?active_only=${activeOnly}&limit=${limit}`
     ),
 
   getFatigueHistory: (sessionId: number) =>
@@ -139,23 +236,27 @@ export const api = {
       `/api/interventions?${sessionId ? `session_id=${sessionId}&` : ""}limit=${limit}`
     ),
 
-  startCalibration: (userId = 1) =>
+  startCalibration: () =>
     apiFetch<{ status: string; duration: number }>("/api/calibrate", {
       method: "POST",
-      body: JSON.stringify({ action: "start", user_id: userId }),
+      body: JSON.stringify({ action: "start" }),
     }),
 
-  getCalibrationStatus: (userId = 1) =>
+  getCalibrationStatus: () =>
     apiFetch<CalibrationUpdate["status"]>("/api/calibrate", {
       method: "POST",
-      body: JSON.stringify({ action: "status", user_id: userId }),
+      body: JSON.stringify({ action: "status" }),
     }),
 
-  completeCalibration: (userId = 1) =>
-    apiFetch<{ status: string; baselines: Record<string, number>; is_valid: boolean }>(
-      "/api/calibrate",
-      { method: "POST", body: JSON.stringify({ action: "complete", user_id: userId }) }
-    ),
+  completeCalibration: () =>
+    apiFetch<{
+      status: string;
+      baselines: Record<string, number>;
+      is_valid: boolean;
+    }>("/api/calibrate", {
+      method: "POST",
+      body: JSON.stringify({ action: "complete" }),
+    }),
 
   sendBiometricEvent: (event: {
     event_type: string;
@@ -170,16 +271,22 @@ export const api = {
       body: JSON.stringify(event),
     }),
 
-  wipeData: (userId = 1) =>
+  wipeData: () =>
     apiFetch<{ status: string; user_id: number }>("/api/privacy/wipe", {
       method: "POST",
-      body: JSON.stringify({ user_id: userId, confirm: true }),
+      body: JSON.stringify({ confirm: true }),
     }),
 
-  healthCheck: () => apiFetch<{ status: string; service: string }>("/api/health"),
+  healthCheck: () =>
+    apiFetch<{ status: string; service: string }>("/api/health"),
 };
 
-export type WebSocketMessage = FatigueUpdate | CalibrationUpdate | { type: "error"; message: string };
+// --- WebSocket ---
+
+export type WebSocketMessage =
+  | FatigueUpdate
+  | CalibrationUpdate
+  | { type: "error"; message: string };
 
 export function createFatigueWebSocket(
   onMessage: (data: WebSocketMessage) => void,
@@ -187,6 +294,16 @@ export function createFatigueWebSocket(
   onClose?: () => void
 ): WebSocket {
   const ws = new WebSocket(`${WS_BASE}/ws/fatigue`);
+
+  ws.onopen = () => {
+    // Send JWT token as first message for WebSocket auth
+    const auth = getStoredAuth();
+    if (auth) {
+      ws.send(JSON.stringify({ token: auth.access_token }));
+    } else {
+      ws.close(4001, "Not authenticated");
+    }
+  };
 
   ws.onmessage = (event) => {
     const data = JSON.parse(event.data) as WebSocketMessage;

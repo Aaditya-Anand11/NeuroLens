@@ -1,6 +1,16 @@
 """FastAPI entrypoint with WebSocket server for real-time fatigue streaming and REST API.
 
+Security features:
+- JWT authentication on all endpoints
+- Rate limiting via slowapi
+- WebSocket payload size limits and schema validation
+- Proper DB session management
+- DB-backed active session tracking (no global state)
+- Generic error messages (no internal details leaked)
+
 Endpoints:
+- POST /api/auth/register — register a new user
+- POST /api/auth/login — login and receive JWT token
 - WebSocket /ws/fatigue — streams real-time CLI scores and modality data
 - POST /api/calibrate — start/complete calibration session
 - GET /api/session — list sessions or get active session
@@ -10,9 +20,9 @@ Endpoints:
 - POST /api/session/stop — stop the active session
 """
 
-import asyncio
 import base64
 import json
+import logging
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -22,13 +32,20 @@ from typing import Optional
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 from sqlalchemy.orm import Session as DBSession
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from neurolens.backend.auth import (
+    RegisterRequest, LoginRequest, TokenResponse,
+    hash_password, verify_password, create_access_token, get_current_user,
+)
 from neurolens.backend.database.models import (
     Base, engine, get_db, init_db, User, CalibrationProfile,
     Session as SessionModel, FatigueRecord, Intervention,
@@ -41,33 +58,39 @@ from neurolens.backend.fusion.ensemble import FusionEnsemble
 from neurolens.backend.intervention.engine import InterventionEngine, InterventionContext
 from neurolens.backend.utils.calibration import CalibrationSession
 
+logger = logging.getLogger("neurolens")
+
+# --- Rate limiter ---
+limiter = Limiter(key_func=get_remote_address)
+
+# --- WebSocket limits ---
+MAX_WS_MESSAGE_BYTES = 2 * 1024 * 1024  # 2 MB max per message
+MAX_BIOMETRIC_EVENTS_PER_MSG = 50
+MAX_FRAME_PIXELS = 1280 * 960  # ~1.2 megapixels max
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    db = next(get_db())
-    user = db.query(User).filter(User.username == "default").first()
-    if not user:
-        user = User(username="default")
-        db.add(user)
-        db.commit()
-    db.close()
     yield
 
 
 app = FastAPI(
     title="NeuroLens API",
     description="Multimodal Cognitive Fatigue & Mental Overload Detection System",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:3001", "http://127.0.0.1:3001"],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 face_analyzer = FaceVisionAnalyzer()
@@ -78,53 +101,85 @@ fusion_engine = FusionEnsemble()
 intervention_engine = InterventionEngine()
 calibration_session = CalibrationSession()
 
-active_session_id: Optional[int] = None
-session_start_time: Optional[float] = None
 
-
-class SessionStartRequest(BaseModel):
-    user_id: int = 1
-
+# --- Pydantic models with validation ---
 
 class SessionStopRequest(BaseModel):
     session_id: Optional[int] = None
 
 
 class CalibrateRequest(BaseModel):
-    action: str  # "start" or "status" or "complete"
-    user_id: int = 1
+    action: str = Field(..., pattern=r"^(start|status|complete)$")
 
 
 class BiometricEvent(BaseModel):
-    event_type: str  # "key_down", "key_up", "mouse_move", "mouse_click"
-    key: Optional[str] = None
+    event_type: str = Field(..., pattern=r"^(key_down|key_up|mouse_move|mouse_click)$")
+    key: Optional[str] = Field(default=None, max_length=20)
     x: Optional[float] = None
     y: Optional[float] = None
-    button: Optional[str] = None
+    button: Optional[str] = Field(default=None, max_length=10)
     timestamp: Optional[float] = None
 
 
 class WipeRequest(BaseModel):
-    user_id: int = 1
     confirm: bool = False
 
 
-# --- REST Endpoints ---
+# --- Auth Endpoints (public) ---
+
+@app.post("/api/auth/register", response_model=TokenResponse)
+@limiter.limit("5/minute")
+def register(req: RegisterRequest, request: Request, db: DBSession = Depends(get_db)):
+    if len(req.username) < 3 or len(req.username) > 50:
+        raise HTTPException(status_code=400, detail="Username must be 3-50 characters")
+    if len(req.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    existing = db.query(User).filter(User.username == req.username).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Username already taken")
+
+    user = User(username=req.username, password_hash=hash_password(req.password))
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    token = create_access_token(user.id, user.username)
+    return TokenResponse(access_token=token, user_id=user.id, username=user.username)
+
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+@limiter.limit("10/minute")
+def login(req: LoginRequest, request: Request, db: DBSession = Depends(get_db)):
+    user = db.query(User).filter(User.username == req.username).first()
+    if not user or not verify_password(req.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    token = create_access_token(user.id, user.username)
+    return TokenResponse(access_token=token, user_id=user.id, username=user.username)
+
+
+# --- Authenticated REST Endpoints ---
 
 @app.post("/api/session/start")
-def start_session(req: SessionStartRequest, db: DBSession = Depends(get_db)):
-    global active_session_id, session_start_time
-    if active_session_id is not None:
-        existing = db.query(SessionModel).filter(SessionModel.id == active_session_id).first()
-        if existing and existing.is_active:
-            raise HTTPException(status_code=400, detail="A session is already active")
+@limiter.limit("10/minute")
+def start_session(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: DBSession = Depends(get_db),
+):
+    existing = (
+        db.query(SessionModel)
+        .filter(SessionModel.user_id == current_user.id, SessionModel.is_active == True)
+        .first()
+    )
+    if existing:
+        raise HTTPException(status_code=400, detail="A session is already active")
 
-    session = SessionModel(user_id=req.user_id, is_active=True)
+    session = SessionModel(user_id=current_user.id, is_active=True)
     db.add(session)
     db.commit()
     db.refresh(session)
-    active_session_id = session.id
-    session_start_time = time.time()
     fusion_engine.reset()
     intervention_engine.reset()
     return {
@@ -135,29 +190,38 @@ def start_session(req: SessionStartRequest, db: DBSession = Depends(get_db)):
 
 
 @app.post("/api/session/stop")
-def stop_session(req: SessionStopRequest, db: DBSession = Depends(get_db)):
-    global active_session_id, session_start_time
-    sid = req.session_id or active_session_id
-    if sid is None:
-        raise HTTPException(status_code=404, detail="No active session")
+@limiter.limit("10/minute")
+def stop_session(
+    req: SessionStopRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: DBSession = Depends(get_db),
+):
+    if req.session_id:
+        session = db.query(SessionModel).filter(
+            SessionModel.id == req.session_id,
+            SessionModel.user_id == current_user.id,
+        ).first()
+    else:
+        session = db.query(SessionModel).filter(
+            SessionModel.user_id == current_user.id,
+            SessionModel.is_active == True,
+        ).first()
 
-    session = db.query(SessionModel).filter(SessionModel.id == sid).first()
     if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+        raise HTTPException(status_code=404, detail="No active session found")
 
     session.is_active = False
     session.ended_at = datetime.now(timezone.utc)
 
-    records = db.query(FatigueRecord).filter(FatigueRecord.session_id == sid).all()
+    records = db.query(FatigueRecord).filter(FatigueRecord.session_id == session.id).all()
     if records:
         cli_scores = [r.cli_score for r in records]
         session.average_cli = sum(cli_scores) / len(cli_scores)
         session.peak_cli = max(cli_scores)
-    session.total_interventions = db.query(Intervention).filter(Intervention.session_id == sid).count()
+    session.total_interventions = db.query(Intervention).filter(Intervention.session_id == session.id).count()
 
     db.commit()
-    active_session_id = None
-    session_start_time = None
     return {
         "session_id": session.id,
         "ended_at": session.ended_at.isoformat(),
@@ -168,13 +232,15 @@ def stop_session(req: SessionStopRequest, db: DBSession = Depends(get_db)):
 
 
 @app.get("/api/session")
+@limiter.limit("30/minute")
 def get_sessions(
-    user_id: int = Query(default=1),
+    request: Request,
     active_only: bool = Query(default=False),
-    limit: int = Query(default=20),
+    limit: int = Query(default=20, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
     db: DBSession = Depends(get_db),
 ):
-    query = db.query(SessionModel).filter(SessionModel.user_id == user_id)
+    query = db.query(SessionModel).filter(SessionModel.user_id == current_user.id)
     if active_only:
         query = query.filter(SessionModel.is_active == True)
     sessions = query.order_by(SessionModel.started_at.desc()).limit(limit).all()
@@ -193,10 +259,20 @@ def get_sessions(
 
 
 @app.get("/api/fatigue/history")
+@limiter.limit("30/minute")
 def get_fatigue_history(
+    request: Request,
     session_id: int = Query(...),
+    current_user: User = Depends(get_current_user),
     db: DBSession = Depends(get_db),
 ):
+    session = db.query(SessionModel).filter(
+        SessionModel.id == session_id,
+        SessionModel.user_id == current_user.id,
+    ).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
     records = (
         db.query(FatigueRecord)
         .filter(FatigueRecord.session_id == session_id)
@@ -218,12 +294,16 @@ def get_fatigue_history(
 
 
 @app.get("/api/interventions")
+@limiter.limit("30/minute")
 def get_interventions(
+    request: Request,
     session_id: Optional[int] = Query(default=None),
-    limit: int = Query(default=50),
+    limit: int = Query(default=50, ge=1, le=200),
+    current_user: User = Depends(get_current_user),
     db: DBSession = Depends(get_db),
 ):
-    query = db.query(Intervention)
+    user_session_ids = db.query(SessionModel.id).filter(SessionModel.user_id == current_user.id).subquery()
+    query = db.query(Intervention).filter(Intervention.session_id.in_(user_session_ids))
     if session_id is not None:
         query = query.filter(Intervention.session_id == session_id)
     interventions = query.order_by(Intervention.triggered_at.desc()).limit(limit).all()
@@ -244,7 +324,13 @@ def get_interventions(
 
 
 @app.post("/api/calibrate")
-def calibrate(req: CalibrateRequest, db: DBSession = Depends(get_db)):
+@limiter.limit("10/minute")
+def calibrate(
+    req: CalibrateRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: DBSession = Depends(get_db),
+):
     if req.action == "start":
         calibration_session.start()
         return {"status": "started", "duration": 60}
@@ -254,9 +340,9 @@ def calibrate(req: CalibrateRequest, db: DBSession = Depends(get_db)):
         if not calibration_session.is_complete:
             return {"status": "not_complete", "progress": calibration_session.get_progress()}
         result = calibration_session.get_result()
-        profile = db.query(CalibrationProfile).filter(CalibrationProfile.user_id == req.user_id).first()
+        profile = db.query(CalibrationProfile).filter(CalibrationProfile.user_id == current_user.id).first()
         if profile is None:
-            profile = CalibrationProfile(user_id=req.user_id)
+            profile = CalibrationProfile(user_id=current_user.id)
             db.add(profile)
         profile.baseline_blink_rate = result.baseline_blink_rate
         profile.baseline_perclos = result.baseline_perclos
@@ -287,7 +373,12 @@ def calibrate(req: CalibrateRequest, db: DBSession = Depends(get_db)):
 
 
 @app.post("/api/biometric/event")
-def record_biometric_event(event: BiometricEvent):
+@limiter.limit("120/minute")
+def record_biometric_event(
+    event: BiometricEvent,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
     ts = event.timestamp or time.time()
     if event.event_type in ("key_down", "key_up"):
         biometrics_analyzer.record_key_event(
@@ -305,28 +396,38 @@ def record_biometric_event(event: BiometricEvent):
 
 
 @app.post("/api/privacy/wipe")
-def wipe_data(req: WipeRequest, db: DBSession = Depends(get_db)):
+@limiter.limit("3/hour")
+def wipe_data(
+    req: WipeRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: DBSession = Depends(get_db),
+):
     if not req.confirm:
         raise HTTPException(status_code=400, detail="Set confirm=true to wipe all session data")
+
+    user_id = current_user.id
     db.query(FatigueRecord).filter(
         FatigueRecord.session_id.in_(
-            db.query(SessionModel.id).filter(SessionModel.user_id == req.user_id)
+            db.query(SessionModel.id).filter(SessionModel.user_id == user_id)
         )
     ).delete(synchronize_session=False)
     db.query(Intervention).filter(
         Intervention.session_id.in_(
-            db.query(SessionModel.id).filter(SessionModel.user_id == req.user_id)
+            db.query(SessionModel.id).filter(SessionModel.user_id == user_id)
         )
     ).delete(synchronize_session=False)
-    db.query(SessionModel).filter(SessionModel.user_id == req.user_id).delete()
-    db.query(CalibrationProfile).filter(CalibrationProfile.user_id == req.user_id).delete()
+    db.query(SessionModel).filter(SessionModel.user_id == user_id).delete()
+    db.query(CalibrationProfile).filter(CalibrationProfile.user_id == user_id).delete()
     db.commit()
-    return {"status": "wiped", "user_id": req.user_id}
+
+    logger.info("User %d (%s) wiped all data", user_id, current_user.username)
+    return {"status": "wiped", "user_id": user_id}
 
 
 # --- WebSocket Endpoint ---
 
-def _get_baselines(db: DBSession, user_id: int = 1) -> dict:
+def _get_baselines(db: DBSession, user_id: int) -> dict:
     """Retrieve calibration baselines for a user, using defaults if not calibrated."""
     profile = db.query(CalibrationProfile).filter(CalibrationProfile.user_id == user_id).first()
     if profile:
@@ -347,62 +448,121 @@ def _get_baselines(db: DBSession, user_id: int = 1) -> dict:
     }
 
 
+def _get_active_session(db: DBSession, user_id: int) -> Optional[SessionModel]:
+    """Get the active session from the DB instead of global state."""
+    return (
+        db.query(SessionModel)
+        .filter(SessionModel.user_id == user_id, SessionModel.is_active == True)
+        .first()
+    )
+
+
 @app.websocket("/ws/fatigue")
 async def websocket_fatigue(websocket: WebSocket):
     """WebSocket endpoint streaming real-time fatigue analysis.
 
-    Client sends JSON with:
+    Client must send an initial auth message: {"token": "<jwt_token>"}
+    Then sends JSON with:
     - "frame": base64-encoded JPEG frame from webcam
     - "audio" (optional): base64-encoded PCM float32 audio chunk
-    - "biometric_events" (optional): list of biometric events
+    - "biometric_events" (optional): list of biometric events (max 50)
     """
     await websocket.accept()
+
+    # --- Authenticate via first message ---
+    try:
+        auth_raw = await websocket.receive_text()
+        auth_data = json.loads(auth_raw)
+        token = auth_data.get("token")
+        if not token:
+            await websocket.send_json({"type": "error", "message": "Authentication required"})
+            await websocket.close(code=4001)
+            return
+
+        from jose import JWTError, jwt as jose_jwt
+        from neurolens.backend.auth import SECRET_KEY, ALGORITHM
+        payload = jose_jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = int(payload["sub"])
+    except (JWTError, KeyError, ValueError, json.JSONDecodeError):
+        await websocket.send_json({"type": "error", "message": "Invalid token"})
+        await websocket.close(code=4001)
+        return
+
     db = next(get_db())
-    baselines = _get_baselines(db)
-    db.close()
+    try:
+        baselines = _get_baselines(db, user_id)
+    finally:
+        db.close()
 
     try:
         while True:
             raw = await websocket.receive_text()
-            data = json.loads(raw)
+
+            # --- Payload size limit ---
+            if len(raw) > MAX_WS_MESSAGE_BYTES:
+                await websocket.send_json({"type": "error", "message": "Message too large"})
+                continue
+
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                await websocket.send_json({"type": "error", "message": "Invalid JSON"})
+                continue
 
             frame = None
             if "frame" in data:
-                frame_bytes = base64.b64decode(data["frame"])
-                nparr = np.frombuffer(frame_bytes, np.uint8)
-                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                try:
+                    frame_bytes = base64.b64decode(data["frame"])
+                    if len(frame_bytes) > MAX_WS_MESSAGE_BYTES:
+                        await websocket.send_json({"type": "error", "message": "Frame too large"})
+                        continue
+                    nparr = np.frombuffer(frame_bytes, np.uint8)
+                    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    if frame is not None and frame.shape[0] * frame.shape[1] > MAX_FRAME_PIXELS:
+                        frame = cv2.resize(frame, (640, 480))
+                except Exception:
+                    frame = None
 
             audio_chunk = None
             if "audio" in data:
-                audio_bytes = base64.b64decode(data["audio"])
-                audio_chunk = np.frombuffer(audio_bytes, dtype=np.float32)
+                try:
+                    audio_bytes = base64.b64decode(data["audio"])
+                    if len(audio_bytes) > 256 * 1024:  # 256 KB max audio chunk
+                        continue
+                    audio_chunk = np.frombuffer(audio_bytes, dtype=np.float32)
+                except Exception:
+                    audio_chunk = None
 
             if "biometric_events" in data:
-                for evt in data["biometric_events"]:
+                events = data["biometric_events"]
+                if not isinstance(events, list):
+                    events = []
+                for evt in events[:MAX_BIOMETRIC_EVENTS_PER_MSG]:
+                    if not isinstance(evt, dict):
+                        continue
+                    event_type = evt.get("event_type", "")
                     ts = evt.get("timestamp", time.time())
-                    if evt["event_type"] in ("key_down", "key_up"):
+                    if event_type in ("key_down", "key_up"):
                         biometrics_analyzer.record_key_event(
-                            key=evt.get("key", ""), event_type=evt["event_type"].replace("key_", ""), timestamp=ts,
+                            key=str(evt.get("key", ""))[:20], event_type=event_type.replace("key_", ""), timestamp=ts,
                         )
-                    elif evt["event_type"] == "mouse_move":
+                    elif event_type == "mouse_move":
                         biometrics_analyzer.record_mouse_event(
                             x=evt.get("x", 0), y=evt.get("y", 0), event_type="move", timestamp=ts,
                         )
-                    elif evt["event_type"] == "mouse_click":
+                    elif event_type == "mouse_click":
                         biometrics_analyzer.record_mouse_event(
                             x=evt.get("x", 0), y=evt.get("y", 0), event_type="click",
                             button=evt.get("button"), timestamp=ts,
                         )
 
             # --- Analyze all modalities ---
-            # Vision: extract face landmarks once, reuse for eye tracking
             vision_features = face_analyzer.analyze_frame(frame) if frame is not None else None
             has_vision = vision_features is not None and vision_features.landmarks_detected
             vision_score = face_analyzer.compute_fatigue_score(
                 vision_features, baselines["blink_rate"], baselines["perclos"],
             ) if has_vision else None
 
-            # Eye tracking: reuse face landmarks from vision pass (no duplicate FaceMesh)
             avg_ear = 0.3
             if has_vision:
                 avg_ear = (vision_features.left_ear + vision_features.right_ear) / 2.0
@@ -422,14 +582,12 @@ async def websocket_fatigue(websocket: WebSocket):
                 eye_features, baselines["gaze_stability"],
             ) if has_eye else None
 
-            # Biometrics: always available (keyboard/mouse events buffered)
             bio_features = biometrics_analyzer.analyze()
             has_bio = bio_features.has_keystroke_data or bio_features.has_mouse_data
             bio_score = biometrics_analyzer.compute_fatigue_score(
                 bio_features, baselines["typing_speed"], baselines["typing_entropy"], baselines["mouse_jitter"],
             ) if has_bio else None
 
-            # Audio: only score when speech is detected
             audio_features = audio_analyzer.analyze_chunk(audio_chunk) if audio_chunk is not None else None
             has_audio = audio_features is not None and audio_features.has_speech
             audio_score = audio_analyzer.compute_fatigue_score(
@@ -452,49 +610,50 @@ async def websocket_fatigue(websocket: WebSocket):
                 })
                 continue
 
-            # Use None-aware fusion: only fuse modalities that have real data
             fusion_result = fusion_engine.fuse(
-                vision_score if vision_score is not None else None,
-                eye_score if eye_score is not None else None,
-                bio_score if bio_score is not None else None,
-                audio_score if audio_score is not None else None,
+                vision_score, eye_score, bio_score, audio_score,
             )
-            # For display, show 0.0 for inactive modalities
-            vision_score = vision_score if vision_score is not None else 0.0
-            eye_score = eye_score if eye_score is not None else 0.0
-            bio_score = bio_score if bio_score is not None else 0.0
-            audio_score = audio_score if audio_score is not None else 0.0
+            vision_display = vision_score if vision_score is not None else 0.0
+            eye_display = eye_score if eye_score is not None else 0.0
+            bio_display = bio_score if bio_score is not None else 0.0
+            audio_display = audio_score if audio_score is not None else 0.0
 
-            if active_session_id is not None:
-                db = next(get_db())
-                record = FatigueRecord(
-                    session_id=active_session_id,
-                    cli_score=fusion_result.cli_score,
-                    fatigue_stage=fusion_result.fatigue_stage,
-                    vision_score=vision_score,
-                    eye_score=eye_score,
-                    biometric_score=bio_score,
-                    audio_score=audio_score,
-                    raw_features={
-                        "blink_rate": vision_features.blink_rate if vision_features else 0,
-                        "perclos": vision_features.perclos if vision_features else 0,
-                        "gaze_stability": eye_features.fixation_stability if eye_features else 0,
-                        "typing_wpm": bio_features.keystroke.typing_speed_wpm if bio_features.has_keystroke_data else 0,
-                    },
-                )
-                db.add(record)
-                db.commit()
+            # --- DB-backed session tracking ---
+            active_session = None
+            elapsed = 0.0
+            db = next(get_db())
+            try:
+                active_session = _get_active_session(db, user_id)
+                if active_session is not None:
+                    record = FatigueRecord(
+                        session_id=active_session.id,
+                        cli_score=fusion_result.cli_score,
+                        fatigue_stage=fusion_result.fatigue_stage,
+                        vision_score=vision_display,
+                        eye_score=eye_display,
+                        biometric_score=bio_display,
+                        audio_score=audio_display,
+                        raw_features={
+                            "blink_rate": vision_features.blink_rate if vision_features else 0,
+                            "perclos": vision_features.perclos if vision_features else 0,
+                            "gaze_stability": eye_features.fixation_stability if eye_features else 0,
+                            "typing_wpm": bio_features.keystroke.typing_speed_wpm if bio_features.has_keystroke_data else 0,
+                        },
+                    )
+                    db.add(record)
+                    db.commit()
+                    elapsed = (datetime.now(timezone.utc) - active_session.started_at).total_seconds() / 60.0
+            finally:
                 db.close()
 
-            elapsed = (time.time() - session_start_time) / 60.0 if session_start_time else 0.0
             ctx = InterventionContext(
                 cli_score=fusion_result.cli_score,
                 fatigue_stage=fusion_result.fatigue_stage,
                 session_duration_minutes=elapsed,
-                vision_score=vision_score,
-                eye_score=eye_score,
-                biometric_score=bio_score,
-                audio_score=audio_score,
+                vision_score=vision_display,
+                eye_score=eye_display,
+                biometric_score=bio_display,
+                audio_score=audio_display,
                 blink_rate=vision_features.blink_rate if vision_features else 0,
                 perclos=vision_features.perclos if vision_features else 0,
                 typing_speed=bio_features.keystroke.typing_speed_wpm if bio_features.has_keystroke_data else 0,
@@ -514,19 +673,21 @@ async def websocket_fatigue(websocket: WebSocket):
                     "severity": intervention_result.severity,
                     "generated_by": intervention_result.generated_by,
                 }
-                if active_session_id is not None:
+                if active_session is not None:
                     db = next(get_db())
-                    intervention_record = Intervention(
-                        session_id=active_session_id,
-                        trigger_cli=fusion_result.cli_score,
-                        trigger_stage=fusion_result.fatigue_stage,
-                        trigger_modality=intervention_result.trigger_modality,
-                        message=intervention_result.message,
-                        intervention_type=intervention_result.intervention_type,
-                    )
-                    db.add(intervention_record)
-                    db.commit()
-                    db.close()
+                    try:
+                        intervention_record = Intervention(
+                            session_id=active_session.id,
+                            trigger_cli=fusion_result.cli_score,
+                            trigger_stage=fusion_result.fatigue_stage,
+                            trigger_modality=intervention_result.trigger_modality,
+                            message=intervention_result.message,
+                            intervention_type=intervention_result.intervention_type,
+                        )
+                        db.add(intervention_record)
+                        db.commit()
+                    finally:
+                        db.close()
 
             response = {
                 "type": "fatigue_update",
@@ -534,10 +695,10 @@ async def websocket_fatigue(websocket: WebSocket):
                 "fatigue_stage": fusion_result.fatigue_stage,
                 "confidence": fusion_result.confidence,
                 "modalities": {
-                    "vision": round(vision_score, 1),
-                    "eye": round(eye_score, 1),
-                    "biometric": round(bio_score, 1),
-                    "audio": round(audio_score, 1),
+                    "vision": round(vision_display, 1),
+                    "eye": round(eye_display, 1),
+                    "biometric": round(bio_display, 1),
+                    "audio": round(audio_display, 1),
                 },
                 "details": {
                     "blink_rate": vision_features.blink_rate if vision_features else 0,
@@ -555,7 +716,7 @@ async def websocket_fatigue(websocket: WebSocket):
                     "audio_valence": round(audio_features.valence, 2) if audio_features else 0,
                 },
                 "session": {
-                    "id": active_session_id,
+                    "id": active_session.id if active_session else None,
                     "duration_minutes": round(elapsed, 1),
                 },
                 "intervention": intervention_data,
@@ -565,9 +726,10 @@ async def websocket_fatigue(websocket: WebSocket):
 
     except WebSocketDisconnect:
         pass
-    except Exception as e:
+    except Exception:
+        logger.exception("WebSocket error for user %d", user_id)
         try:
-            await websocket.send_json({"type": "error", "message": str(e)})
+            await websocket.send_json({"type": "error", "message": "Internal server error"})
         except Exception:
             pass
 
